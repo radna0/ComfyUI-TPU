@@ -99,7 +99,7 @@ except:
     )
 
 XLA_AVAILABLE = False
-if args.xla or args.xla_fsdp:
+if args.xla or args.xla_spmd:
     try:
         XLA_AVAILABLE = importlib.util.find_spec("torch_xla") is not None
         xla_version = importlib_metadata.version("torch_xla")
@@ -111,6 +111,20 @@ if args.xla or args.xla_fsdp:
         raise ImportError("PyTorch XLA not installed.")
 
 
+if args.xla_spmd and XLA_AVAILABLE:
+    import numpy as np
+    from torch_xla import runtime as xr
+    import torch_xla.distributed.spmd as xs
+
+    xr.use_spmd()
+
+    num_devices = xr.global_runtime_device_count()
+    mesh_shape = (num_devices, 1)
+    device_ids = np.array(range(num_devices))
+    # To be noted, the mesh must have an axis named 'fsdp', which the weights and activations will be sharded on.
+    mesh = xs.Mesh(device_ids, mesh_shape, ("fsdp", "model"))
+    xs.set_global_mesh(mesh)
+
 try:
     if torch.backends.mps.is_available():
         cpu_state = CPUState.MPS
@@ -121,15 +135,39 @@ except:
 if args.cpu:
     cpu_state = CPUState.CPU
 
-if (args.xla or args.xla_fsdp) and XLA_AVAILABLE:
+if (args.xla or args.xla_spmd) and XLA_AVAILABLE:
     cpu_state = CPUState.XLA
 
 
 def get_xla_memory_info(dev):
-    # xm.get_memory_info(dev) only has bytes_limit and bytes_used
-    mem_reserved = xm.get_memory_info(dev)["bytes_used"]
-    # minus 1GB for safety
-    mem_total = xm.get_memory_info(dev)["bytes_limit"]
+    if args.xla_spmd:
+        # tpu-info is needed to track TPUs memory usage when using SPMD/FSDP
+        try:
+            from tpu_info import device
+            from tpu_info import metrics
+        except ImportError:
+            raise ImportError(
+                "Please install tpu-info from https://github.com/AI-Hypercomputer/cloud-accelerator-diagnostics/tree/main/tpu_info"
+            )
+
+        mem_reserved, mem_total = 0, 0
+
+        chip_type, count = device.get_local_chips()
+        if not chip_type or not count:
+            raise RuntimeError("No TPU devices found.")
+
+        device_usage = metrics.get_chip_usage(chip_type)
+        for chip in device_usage:
+            mem_reserved += chip.memory_usage
+            mem_total += chip.total_memory
+
+        mem_reserved /= 3
+        mem_total /= 3
+    else:
+        # xm.get_memory_info(dev) only has bytes_limit and bytes_used
+        mem_reserved = xm.get_memory_info(dev)["bytes_used"]
+        # minus 1GB for safety
+        mem_total = xm.get_memory_info(dev)["bytes_limit"]
     return (mem_reserved, mem_total)
 
 
@@ -179,6 +217,17 @@ def get_total_memory(dev=None, torch_total_too=False):
             mem_total_torch = mem_reserved
             mem_total = torch.xpu.get_device_properties(dev).total_memory
         elif cpu_state == CPUState.XLA:
+            """if args.xla_spmd:
+                # When using SPMD/FSDP for XLA, the memory cannot be tracked as no two program can be spawned.
+                # please use tpu-info
+                # TPUv2-8 has 8 x 8B of memory, a total of 64GB
+                # TPUv3-8 has 8 x 16GB of memory, a total of 128GB
+                logging.info(
+                    "Using FSDP for XLA, memory cannot be tracked, please use tpu-info instead."
+                )
+                mem_total = 8 * 16 * 1024 * 1024 * 1024
+                mem_total_torch = mem_total
+            else:"""
             mem_total_torch, mem_total = get_xla_memory_info(dev)
         else:
             stats = torch.cuda.memory_stats(dev)
@@ -1156,6 +1205,17 @@ def get_free_memory(dev=None, torch_free_too=False):
             )
             mem_free_total = mem_free_xpu + mem_free_torch
         elif cpu_state == CPUState.XLA:
+            """if args.xla_spmd:
+                # When using SPMD/FSDP for XLA, the memory cannot be tracked as no two program can be spawned.
+                # please install tpu-info, https://github.com/AI-Hypercomputer/cloud-accelerator-diagnostics/tree/main/tpu_info
+                # TPUv2-8 has 8 x 8B of memory, a total of 64GB
+                # TPUv3-8 has 8 x 16GB of memory, a total of 128GB
+                logging.info(
+                    "Using FSDP for XLA, memory cannot be tracked, please use tpu-info instead."
+                )
+                mem_free_total = 8 * 16 * 1024 * 1024 * 1024
+                mem_free_torch = mem_free_total
+            else:"""
             mem_reserved, mem_total = get_xla_memory_info(dev)
             mem_free_total = mem_total - mem_reserved
             mem_free_torch = mem_free_total
